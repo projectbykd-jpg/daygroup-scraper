@@ -64,9 +64,10 @@ async function getAll(urls, headers, batch = 25) {
  * urlOf(p) -> url; parseFn(html) -> array baris; keyOf(row) -> string dedup.
  * firstHtml boleh diberikan (hasil fetch halaman 1) supaya tidak diambil 2x.
  */
-async function pagesUntilEmpty(urlOf, headers, parseFn, keyOf, firstHtml, { chunk = 20, max = 3000 } = {}) {
+async function pagesUntilEmpty(urlOf, headers, parseFn, keyOf, firstHtml, { chunk = 20, max = 5000 } = {}) {
 	const rows = [];
 	const seen = new Set();
+	let pagesScanned = 0;
 	const eat = (html) => {
 		let added = 0;
 		for (const r of parseFn(html)) {
@@ -81,8 +82,10 @@ async function pagesUntilEmpty(urlOf, headers, parseFn, keyOf, firstHtml, { chun
 	let start = 1;
 	if (firstHtml != null) {
 		eat(firstHtml);
+		pagesScanned = 1;
 		start = 2;
 	}
+	let emptyStreak = 0; // halaman berturut yang 0 baris data mentah
 	for (let page = start; page <= max; page += chunk) {
 		const urls = [];
 		for (let p = page; p < page + chunk && p <= max; p++) urls.push(urlOf(p));
@@ -90,19 +93,26 @@ async function pagesUntilEmpty(urlOf, headers, parseFn, keyOf, firstHtml, { chun
 		let addedInChunk = 0;
 		let hitEnd = false;
 		for (const h of htmls) {
+			pagesScanned++;
 			if (!h || h.length < 400 || /silakan login|please login|Password<\/label>/i.test(h)) {
 				hitEnd = true;
 				break;
 			}
+			const parsed = parseFn(h);
 			const a = eat(h);
 			addedInChunk += a;
-			if (a === 0 && !parseFn(h).length) {
-				hitEnd = true;
-				break;
+			if (parsed.length === 0) {
+				emptyStreak++;
+				if (emptyStreak >= 3) { hitEnd = true; break; }
+			} else {
+				emptyStreak = 0;
 			}
 		}
+		// Berhenti hanya kalau ketemu ujung (login/empty streak) ATAU 1 chunk penuh
+		// (20 halaman) tanpa 1 pun baris baru — server benar-benar mengulang / habis.
 		if (hitEnd || addedInChunk === 0) break;
 	}
+	rows._pagesScanned = pagesScanned;
 	return rows;
 }
 
@@ -399,15 +409,6 @@ async function scrapeReportAgent(baseUrl, headers, startDate, endDate) {
 // MODUL 3: CHECK KOIN + WITHDRAW (PGA-IDF)
 // ---------------------------------------------------------------------------
 async function scrapeCheckCoin(baseUrl, headers, startDate, endDate) {
-	const filterKata = [
-		"Deposit (PGA)",
-		"Create Master",
-		"Withdraw(PGA-IDF)",
-		"Reject(Deposit)",
-		"REJECT(Deposit)",
-		"Reject(Withdraw)",
-		"REJECT(Withdraw)",
-	];
 	const coinUrl = (p) =>
 		`${baseUrl}/his_coin.php?page=${p}&bts=500&info=&userto=&datex=${startDate}&datex2=${endDate}&userby=&cekparam=1`;
 
@@ -415,16 +416,17 @@ async function scrapeCheckCoin(baseUrl, headers, startDate, endDate) {
 	if (/Password|silakan login/i.test(htmlP1) || htmlP1.length < 500) {
 		throw new Error("Cookie Admin kedaluwarsa saat menarik History Koin!");
 	}
-	// Ambil SEMUA halaman his_coin (server abaikan bts -> ~100 baris/halaman).
-	// pagesUntilEmpty berhenti begitu 1 halaman tak menambah baris baru.
+	// Ambil SEMUA halaman his_coin, TANPA filter — biar running-balance lengkap &
+	// user lihat sampai baris terakhir. (server abaikan bts -> ~100 baris/halaman)
 	const raw = await pagesUntilEmpty(
 		coinUrl,
 		headers,
-		(h) => parseCoinHtmlRows(h, filterKata),
+		(h) => parseCoinHtmlRows(h, []),
 		coinKey,
 		htmlP1,
-		{ chunk: 20, max: 4000 },
+		{ chunk: 20, max: 6000 },
 	);
+	const pagesScanned = raw._pagesScanned || 0;
 
 	raw.reverse();
 	const checkCoinData = [];
@@ -514,6 +516,8 @@ async function scrapeCheckCoin(baseUrl, headers, startDate, endDate) {
 		totalSelisih,
 		withdrawPgaIdfData: wdList,
 		totalNominalWdPgaIdf,
+		pagesScanned,
+		rawTotal: raw.length,
 	};
 }
 
@@ -708,9 +712,16 @@ async function scrapeMozart(base, cookie, startDate, endDate) {
 		data.idSelisih = cc.idSelisihData;
 		data.withdrawPgaIdf = cc.withdrawPgaIdfData;
 		data.checkCoinMeta = [
-			{ totalSelisih: cc.totalSelisih, totalNominalWdPgaIdf: cc.totalNominalWdPgaIdf },
+			{
+				totalSelisih: cc.totalSelisih,
+				totalNominalWdPgaIdf: cc.totalNominalWdPgaIdf,
+				pagesScanned: cc.pagesScanned,
+				rawTotal: cc.rawTotal,
+			},
 		];
-		console.log(`checkCoin: ${cc.checkCoinData.length} baris, ${cc.idSelisihData.length} id selisih, ${cc.withdrawPgaIdfData.length} wd`);
+		console.log(
+			`checkCoin: ${cc.checkCoinData.length} baris (${cc.pagesScanned} halaman), ${cc.idSelisihData.length} id selisih, ${cc.withdrawPgaIdfData.length} wd`,
+		);
 	} catch (e) {
 		errors.checkCoin = e.message;
 		console.error("checkCoin:", e.message);
