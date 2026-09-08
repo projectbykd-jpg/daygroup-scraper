@@ -1,0 +1,31 @@
+name: Scrape Laporan Harian
+
+# Dipicu oleh panel-worker via GitHub API (workflow_dispatch).
+# Repo ini PUBLIK dan TIDAK menyimpan rahasia apa pun — kredensial admin
+# diambil saat runtime lewat callback ke panel-worker memakai token sekali-pakai.
+
+on:
+  workflow_dispatch:
+    inputs:
+      job_id:      { description: "ID job di panel-worker", required: true }
+      callback:    { description: "Base URL panel-worker (https://...)", required: true }
+      key:         { description: "Token sekali-pakai untuk callback", required: true }
+
+concurrency:
+  group: scrape-${{ github.event.inputs.job_id }}
+  cancel-in-progress: false
+
+jobs:
+  scrape:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: "20" }
+      - name: Run scraper
+        env:
+          JOB_ID: ${{ github.event.inputs.job_id }}
+          CALLBACK: ${{ github.event.inputs.callback }}
+          KEY: ${{ github.event.inputs.key }}
+        run: node scrape.mjs
