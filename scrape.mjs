@@ -481,6 +481,120 @@ async function scrapeCheckCoin(baseUrl, headers, startDate, endDate) {
 }
 
 // ---------------------------------------------------------------------------
+// MODUL MOZART  (port scrapeStepMozart) — dijalankan di GitHub Actions karena
+// API Mozart di belakang Cloudflare menolak request dari Cloudflare Worker.
+// ---------------------------------------------------------------------------
+function mozNum(v) {
+	const n = Number(String(v === undefined || v === null ? 0 : v).replace(/[^0-9.\-]/g, ""));
+	return isNaN(n) ? 0 : n;
+}
+function mozFindRows(json) {
+	if (Array.isArray(json)) return json;
+	let best = [];
+	for (const k of Object.keys(json || {})) {
+		const v = json[k];
+		if (Array.isArray(v) && v.length >= best.length && (v.length === 0 || typeof v[0] === "object")) best = v;
+		else if (v && typeof v === "object" && !Array.isArray(v)) {
+			const nested = mozFindRows(v);
+			if (nested.length > best.length) best = nested;
+		}
+	}
+	return best;
+}
+function mozPick(obj, keys, fb) {
+	for (const k of keys) {
+		const v = obj[k];
+		if (v !== undefined && v !== null && String(v).trim() !== "") return v;
+	}
+	return fb;
+}
+async function scrapeMozart(base, cookie, startDate, endDate) {
+	base = base.replace(/\/+$/, "");
+	const hdr = (ref) => ({
+		"content-type": "application/json",
+		accept: "application/json, text/plain, */*",
+		"accept-language": "en-US,en;q=0.9",
+		cookie,
+		origin: base,
+		referer: base + ref,
+		"user-agent": UA,
+	});
+	const PAGE = 100;
+	const fetchAll = async (path, ref, body) => {
+		const rows = [];
+		for (let page = 0; page < 100; page++) {
+			let j;
+			try {
+				const r = await fetch(base + path, {
+					method: "POST",
+					headers: hdr(ref),
+					body: JSON.stringify({ ...body, page_number: page, page_size: PAGE }),
+				});
+				const t = await r.text();
+				if (r.status === 401) throw new Error("MOZART 401: cookie ditolak / kedaluwarsa.");
+				if (r.status === 403) throw new Error("MOZART 403: " + t.slice(0, 150));
+				if (r.status >= 400) throw new Error("MOZART HTTP " + r.status);
+				j = JSON.parse(t);
+			} catch (e) {
+				if (page === 0) throw e;
+				break;
+			}
+			const f = mozFindRows(j);
+			rows.push(...f);
+			if (f.length < PAGE) break;
+		}
+		return rows;
+	};
+	const depoRows = await fetchAll("/api/transactions/fetchTransaction", "/transactions", {
+		panel_id: 0,
+		start_date: startDate,
+		end_date: endDate,
+		not_done_filter: false,
+		filter_by: null,
+	});
+	const wdRows = await fetchAll("/api/wd/fetchWithdrawal", "/wd", {
+		panel_id: 0,
+		start_date: startDate,
+		end_date: endDate,
+		filter_by: { minimum_amount: 0 },
+	});
+	const mozartDepo = depoRows.map((r) => ({
+		date: String(mozPick(r, ["created_at", "date", "transaction_date", "trx_date", "waktu", "time"], "-")),
+		username: String(mozPick(r, ["username", "user", "player", "user_id", "nama_user"], "-")),
+		name: String(mozPick(r, ["name", "sender_name", "recipient", "nama", "account_name"], "-")),
+		amount: mozNum(mozPick(r, ["amount", "nominal", "jumlah"], 0)),
+		bank: String(mozPick(r, ["bank", "bank_name", "bank_code", "app"], "-")),
+		accountNumber: String(mozPick(r, ["account_number", "rekening", "bank_account", "no_rek"], "-")),
+		status: String(mozPick(r, ["status", "status_description", "state", "transaction_status"], "SUCCESS")),
+	}));
+	const mozartWd = wdRows.map((r) => ({
+		date: String(mozPick(r, ["created_at", "date", "transaction_date", "trx_date", "waktu", "time"], "-")),
+		username: String(mozPick(r, ["username", "user", "player", "user_id"], "-")),
+		name: String(mozPick(r, ["name", "recipient", "recipient_name", "nama", "account_name"], "-")),
+		amount: mozNum(mozPick(r, ["amount", "nominal", "jumlah"], 0)),
+		bank: String(mozPick(r, ["destination", "bank", "bank_name", "bank_code", "app", "to_bank"], "-")),
+		accountNumber: String(mozPick(r, ["account_number", "rekening", "bank_account", "no_rek"], "-")),
+		status: String(mozPick(r, ["status", "status_description", "state", "transaction_status"], "-")),
+	}));
+	const sum = (a) => a.reduce((s, x) => s + (x.amount || 0), 0);
+	return {
+		mozartDepo,
+		mozartWd,
+		_mozartMeta: [
+			{
+				summary: {
+					totalDepoRecords: mozartDepo.length,
+					totalDepoAmount: sum(mozartDepo),
+					totalWdRecords: mozartWd.length,
+					totalWdAmount: sum(mozartWd),
+					netAmount: sum(mozartDepo) - sum(mozartWd),
+				},
+			},
+		],
+	};
+}
+
+// ---------------------------------------------------------------------------
 // MAIN
 // ---------------------------------------------------------------------------
 (async () => {
@@ -496,6 +610,24 @@ async function scrapeCheckCoin(baseUrl, headers, startDate, endDate) {
 		process.exit(1);
 	}
 	const { creds, params } = start;
+	const kind = params.kind || "admin";
+
+	if (kind === "mozart") {
+		let mbase = String(creds.linkMozart || "").trim();
+		if (!/^https?:\/\//i.test(mbase)) mbase = "https://" + mbase;
+		try {
+			const data = await scrapeMozart(mbase, String(creds.cookieMozart || "").trim(), params.startDate, params.endDate);
+			await api("lapJobResult", { ok: true, data, errors: {} });
+			console.log("MOZART SELESAI:", data.mozartDepo.length, "dp,", data.mozartWd.length, "wd");
+		} catch (e) {
+			await api("lapJobResult", { ok: false, data: {}, errors: { mozart: e.message } });
+			console.error("mozart:", e.message);
+			process.exit(1);
+		}
+		return;
+	}
+
+	// kind === 'admin'
 	let baseUrl = String(creds.linkAdmin || "").trim();
 	if (!/^https?:\/\//i.test(baseUrl)) baseUrl = "https://" + baseUrl;
 	baseUrl = baseUrl.split("?")[0].split("#")[0].replace(/\/+$/, "");
