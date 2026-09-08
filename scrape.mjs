@@ -59,6 +59,53 @@ async function getAll(urls, headers, batch = 25) {
 	return out;
 }
 
+/**
+ * Halaman 1..N sampai satu halaman tidak menambah data baru.
+ * urlOf(p) -> url; parseFn(html) -> array baris; keyOf(row) -> string dedup.
+ * firstHtml boleh diberikan (hasil fetch halaman 1) supaya tidak diambil 2x.
+ */
+async function pagesUntilEmpty(urlOf, headers, parseFn, keyOf, firstHtml, { chunk = 20, max = 3000 } = {}) {
+	const rows = [];
+	const seen = new Set();
+	const eat = (html) => {
+		let added = 0;
+		for (const r of parseFn(html)) {
+			const k = keyOf(r);
+			if (seen.has(k)) continue;
+			seen.add(k);
+			rows.push(r);
+			added++;
+		}
+		return added;
+	};
+	let start = 1;
+	if (firstHtml != null) {
+		eat(firstHtml);
+		start = 2;
+	}
+	for (let page = start; page <= max; page += chunk) {
+		const urls = [];
+		for (let p = page; p < page + chunk && p <= max; p++) urls.push(urlOf(p));
+		const htmls = await getAll(urls, headers, chunk);
+		let addedInChunk = 0;
+		let hitEnd = false;
+		for (const h of htmls) {
+			if (!h || h.length < 400 || /silakan login|please login|Password<\/label>/i.test(h)) {
+				hitEnd = true;
+				break;
+			}
+			const a = eat(h);
+			addedInChunk += a;
+			if (a === 0 && !parseFn(h).length) {
+				hitEnd = true;
+				break;
+			}
+		}
+		if (hitEnd || addedInChunk === 0) break;
+	}
+	return rows;
+}
+
 // ---------------------------------------------------------------------------
 // Parser helpers (port persis)
 // ---------------------------------------------------------------------------
@@ -185,6 +232,18 @@ function parseCoinHtmlRows(html, filterKata) {
 	}
 	return list;
 }
+function countCoinRows(html) {
+	const rows = html.match(/<tr[^>]*>([\s\S]*?)<\/tr>/gi) || [];
+	let n = 0;
+	for (const r of rows) {
+		const c = r.match(/<td[^>]*>([\s\S]*?)<\/td>/gi);
+		if (c && c.length >= 7 && /^\d+$/.test(cleanHtmlText(c[0]).trim())) n++;
+	}
+	return n;
+}
+function coinKey(r) {
+	return `${r.date}|${r.to}|${r.by}|${r.info}|${r.lastCoin}`;
+}
 function parseWithdrawPgaIdfRows(html) {
 	const list = [];
 	const rows = html.match(/<tr[^>]*>([\s\S]*?)<\/tr>/gi);
@@ -234,22 +293,9 @@ async function scrapeRegister(baseUrl, headers, startDate, endDate) {
 	const [html1, htmlNR1] = await getAll([listUrl(1), nonRefUrl(1)], headers, 2);
 	if (/silakan login|please login/i.test(html1)) throw new Error("Cookie Admin kedaluwarsa (Session Expired).");
 
-	let allPlayers = parseAgentPlayerList(html1);
-	let rawNonRef = parseAgentPlayerList(htmlNR1);
-	const maxPage = Math.max(1, ...((html1.match(/page=(\d+)/g) || []).map((p) => +p.split("=")[1])));
-	const maxNR = Math.max(1, ...((htmlNR1.match(/page=(\d+)/g) || []).map((p) => +p.split("=")[1])));
-
-	const restUrls = [];
-	for (let p = 2; p <= Math.min(maxPage, 1000); p++) restUrls.push({ t: "all", u: listUrl(p) });
-	for (let p = 2; p <= Math.min(maxNR, 10000); p++) restUrls.push({ t: "nr", u: nonRefUrl(p) });
-	if (restUrls.length) {
-		const htmls = await getAll(restUrls.map((x) => x.u), headers, 25);
-		htmls.forEach((h, i) => {
-			const rows = parseAgentPlayerList(h);
-			if (restUrls[i].t === "all") allPlayers = allPlayers.concat(rows);
-			else rawNonRef = rawNonRef.concat(rows);
-		});
-	}
+	const pk = (r) => r.userId;
+	const allPlayers = await pagesUntilEmpty(listUrl, headers, (h) => parseAgentPlayerList(h), pk, html1, { chunk: 20, max: 1500 });
+	const rawNonRef = await pagesUntilEmpty(nonRefUrl, headers, (h) => parseAgentPlayerList(h), pk, htmlNR1, { chunk: 20, max: 1500 });
 
 	// detail depo/wd per player
 	const detail = {};
@@ -322,28 +368,30 @@ async function scrapeReportAgent(baseUrl, headers, startDate, endDate) {
 	);
 	const firstHtmls = await getAll(first.map((x) => x.u), headers, 30);
 	let allData = [];
-	const second = [];
-	firstHtmls.forEach((html, i) => {
-		const rows = parseAgentOperatorRows(html, first[i].op);
+	// per (operator, statusgroup): halaman 1 sudah diambil, lanjut sampai kosong.
+	const rowKey = (r) => `${r.tanggalTerima}|${r.user}|${r.action}|${r.jumlah}|${r.operator}`;
+	for (let i = 0; i < first.length; i++) {
+		const { op, st } = first[i];
+		const urlOf = (p) =>
+			`${baseUrl}/agen_operatorpop.php?page=${p}&${st}&sta=ACCEPT&by=${encodeURIComponent(op)}&date1=${d1}&date2=${d2}`;
+		const rows = await pagesUntilEmpty(
+			urlOf,
+			headers,
+			(h) => parseAgentOperatorRows(h, op),
+			rowKey,
+			firstHtmls[i],
+			{ chunk: 15, max: 120 },
+		);
 		if (rows.length) allData = allData.concat(rows);
-		const pm = html.match(/page=(\d+)/g);
-		if (pm) {
-			const maxPage = Math.max(...pm.map((p) => +p.split("=")[1]));
-			for (let p = 2; p <= Math.min(maxPage, 35); p++) {
-				second.push({
-					op: first[i].op,
-					u: `${baseUrl}/agen_operatorpop.php?page=${p}&${first[i].st}&sta=ACCEPT&by=${encodeURIComponent(first[i].op)}&date1=${d1}&date2=${d2}`,
-				});
-			}
-		}
-	});
-	if (second.length) {
-		const htmls = await getAll(second.map((x) => x.u), headers, 40);
-		htmls.forEach((h, i) => {
-			const rows = parseAgentOperatorRows(h, second[i].op);
-			if (rows.length) allData = allData.concat(rows);
-		});
 	}
+	// dedup lintas statusgroup
+	const seen = new Set();
+	allData = allData.filter((r) => {
+		const k = rowKey(r);
+		if (seen.has(k)) return false;
+		seen.add(k);
+		return true;
+	});
 	return { reportAgentData: allData, operatorList: operators };
 }
 
@@ -367,17 +415,16 @@ async function scrapeCheckCoin(baseUrl, headers, startDate, endDate) {
 	if (/Password|silakan login/i.test(htmlP1) || htmlP1.length < 500) {
 		throw new Error("Cookie Admin kedaluwarsa saat menarik History Koin!");
 	}
-	let raw = parseCoinHtmlRows(htmlP1, filterKata);
-	const maxCoinPage = Math.max(1, ...((htmlP1.match(/page=(\d+)/g) || []).map((p) => +p.split("=")[1])));
-	if (maxCoinPage > 1) {
-		const urls = [];
-		for (let p = 2; p <= Math.min(maxCoinPage, 5000); p++) urls.push(coinUrl(p));
-		const htmls = await getAll(urls, headers, 30);
-		for (const h of htmls) {
-			const rows = parseCoinHtmlRows(h, filterKata);
-			if (rows.length) raw = raw.concat(rows);
-		}
-	}
+	// Ambil SEMUA halaman his_coin (server abaikan bts -> ~100 baris/halaman).
+	// pagesUntilEmpty berhenti begitu 1 halaman tak menambah baris baru.
+	const raw = await pagesUntilEmpty(
+		coinUrl,
+		headers,
+		(h) => parseCoinHtmlRows(h, filterKata),
+		coinKey,
+		htmlP1,
+		{ chunk: 20, max: 4000 },
+	);
 
 	raw.reverse();
 	const checkCoinData = [];
@@ -447,28 +494,18 @@ async function scrapeCheckCoin(baseUrl, headers, startDate, endDate) {
 	const idSelisihData = idList.map((it, i) => ({ no: i + 1, userId: it.id || "-", nominal: it.total }));
 	const totalSelisih = idSelisihData.reduce((s, x) => s + x.nominal, 0);
 
-	// withdraw PGA-IDF
+	// withdraw PGA-IDF (semua halaman)
 	const wdUrl = (p) =>
 		`${baseUrl}/his_coin.php?info=Withdraw%28PGA-IDF%29&userto=&userby=&datex=${startDate}&datex2=${endDate}&nominal=&page=${p}`;
-	let wdList = parseWithdrawPgaIdfRows(await getText(wdUrl(1), headers));
-	if (wdList.length) {
-		let page = 2;
-		let more = true;
-		while (more && page <= 5000) {
-			const urls = [];
-			for (let p = page; p < page + 30 && p <= 5000; p++) urls.push(wdUrl(p));
-			const htmls = await getAll(urls, headers, 30);
-			for (const h of htmls) {
-				const rows = parseWithdrawPgaIdfRows(h);
-				if (!rows.length) {
-					more = false;
-					break;
-				}
-				wdList = wdList.concat(rows);
-			}
-			page += 30;
-		}
-	}
+	const wdList = await pagesUntilEmpty(
+		wdUrl,
+		headers,
+		(h) => parseWithdrawPgaIdfRows(h),
+		(r) => `${r.date}|${r.to}|${r.by}|${r.nominal}`,
+		null,
+		{ chunk: 20, max: 3000 },
+	);
+	wdList.forEach((r, i) => (r.no = i + 1));
 	const totalNominalWdPgaIdf = wdList.reduce((s, x) => s + x.nominal, 0);
 
 	return {
