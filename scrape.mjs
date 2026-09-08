@@ -673,13 +673,13 @@ async function scrapeMozart(base, cookie, startDate, endDate) {
 		data.checkCoinMeta = [
 			{ totalSelisih: cc.totalSelisih, totalNominalWdPgaIdf: cc.totalNominalWdPgaIdf },
 		];
-		console.log(`checkCoin: ${cc.checkCoinData.length} baris, ${cc.idSelisihData.length} id selisih, ${cc.withdrawPgaIdf.length} wd`);
+		console.log(`checkCoin: ${cc.checkCoinData.length} baris, ${cc.idSelisihData.length} id selisih, ${cc.withdrawPgaIdfData.length} wd`);
 	} catch (e) {
 		errors.checkCoin = e.message;
 		console.error("checkCoin:", e.message);
 	}
 
-	const ok = Object.keys(data).length > 0;
+	const ok = Object.keys(data).filter((k) => Array.isArray(data[k]) && k !== "registerMeta").length > 0;
 	await api("lapJobResult", { ok, data, errors });
 	console.log(ok ? "SELESAI" : "GAGAL total");
 	if (!ok) process.exit(1);
