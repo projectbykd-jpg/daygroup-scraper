@@ -509,7 +509,8 @@ function mozPick(obj, keys, fb) {
 	return fb;
 }
 async function scrapeMozart(base, cookie, startDate, endDate) {
-	base = base.replace(/\/+$/, "");
+	const hm = String(base || "").match(/^(https?:\/\/[^/\s?#]+)/i);
+	base = hm ? hm[1] : base.replace(/\/+$/, "");
 	const hdr = (ref) => ({
 		"content-type": "application/json",
 		accept: "application/json, text/plain, */*",
@@ -531,8 +532,15 @@ async function scrapeMozart(base, cookie, startDate, endDate) {
 					body: JSON.stringify({ ...body, page_number: page, page_size: PAGE }),
 				});
 				const t = await r.text();
-				if (r.status === 401) throw new Error("MOZART 401: cookie ditolak / kedaluwarsa.");
-				if (r.status === 403) throw new Error("MOZART 403: " + t.slice(0, 150));
+				if (r.status === 401) throw new Error("MOZART 401: cookie ditolak / kedaluwarsa. Perbarui cookie Mozart.");
+				if (r.status === 403 || r.status === 503) {
+					const cf = /cloudflare|cf-ray|attention required|just a moment|ie6 oldie|__cf_chl|challenge-platform/i.test(t);
+					throw new Error(
+						cf
+							? "MOZART diblokir Cloudflare. Tempel COOKIE LENGKAP dari browser (harus ada cf_clearance), dan pastikan Link Mozart hanya domain (tanpa /wd)."
+							: "MOZART " + r.status + ": " + t.slice(0, 120),
+					);
+				}
 				if (r.status >= 400) throw new Error("MOZART HTTP " + r.status);
 				j = JSON.parse(t);
 			} catch (e) {
