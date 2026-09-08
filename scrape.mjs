@@ -428,15 +428,22 @@ async function scrapeCheckCoin(baseUrl, headers, startDate, endDate) {
 	);
 	const pagesScanned = raw._pagesScanned || 0;
 
+	// Baris yang DIKECUALIKAN dari perhitungan running-balance / selisih
+	// (transaksi player-gateway & admin action yang tidak menyentuh coin agen).
+	const EXCLUDE = ["deposit (pga)", "create master", "withdraw(pga-idf)", "reject(deposit)", "reject(withdraw)"];
+	const isExcluded = (info) => EXCLUDE.some((k) => String(info || "").toLowerCase().includes(k));
+
 	raw.reverse();
 	const checkCoinData = [];
 	const rawDiff = [];
+	let prevCalcRow = null; // baris terakhir yang ikut perhitungan
 	for (let i = 0; i < raw.length; i++) {
 		const cur = raw[i];
+		const excl = isExcluded(cur.info);
 		let calc = cur.lastCoin;
 		let diff = 0;
-		if (i > 0) {
-			const prev = raw[i - 1];
+		if (!excl && prevCalcRow) {
+			const prev = prevCalcRow;
 			const info = (cur.info || "").toLowerCase();
 			if (info.includes("deposit agent")) calc = prev.lastCoin + cur.deposit;
 			else if (info.includes("withdraw agent")) calc = prev.lastCoin - cur.withdraw;
@@ -455,10 +462,14 @@ async function scrapeCheckCoin(baseUrl, headers, startDate, endDate) {
 			deposit: cur.deposit,
 			withdraw: cur.withdraw,
 			lastCoin: cur.lastCoin,
-			selisih: diff,
-			calcCoin: calc,
+			selisih: excl ? 0 : diff,
+			calcCoin: excl ? cur.lastCoin : calc,
+			excluded: excl,
 		});
-		rawDiff.push({ to: cur.to, selisih: diff });
+		if (!excl) {
+			prevCalcRow = cur;
+			rawDiff.push({ to: cur.to, selisih: diff });
+		}
 	}
 	if (raw.length) {
 		const fin = raw[raw.length - 1].lastCoin;
