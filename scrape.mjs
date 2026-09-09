@@ -565,10 +565,18 @@ async function scrapeMozart(base, cookie, startDate, endDate) {
 	base = hm ? hm[1] : base.replace(/\/+$/, "");
 	const host = base.replace(/^https?:\/\//, "");
 
-	// API Mozart di belakang Cloudflare -> pakai browser asli (Playwright) untuk
+	// API Mozart di belakang Cloudflare -> pakai browser asli + stealth untuk
 	// melewati challenge, lalu fetch API DARI DALAM konteks browser (punya cf_clearance).
-	const { chromium } = await import("playwright");
-	const browser = await chromium.launch({ headless: true, args: ["--no-sandbox"] });
+	let chromium;
+	try {
+		const pe = await import("playwright-extra");
+		const stealth = (await import("puppeteer-extra-plugin-stealth")).default;
+		chromium = pe.chromium;
+		chromium.use(stealth());
+	} catch {
+		chromium = (await import("playwright")).chromium;
+	}
+	const browser = await chromium.launch({ headless: true, args: ["--no-sandbox", "--disable-blink-features=AutomationControlled"] });
 	const ctx = await browser.newContext({
 		userAgent: UA,
 		locale: "en-US",
@@ -586,19 +594,25 @@ async function scrapeMozart(base, cookie, startDate, endDate) {
 	if (cookies.length) await ctx.addCookies(cookies);
 
 	const page = await ctx.newPage();
-	const fetchAll = async (path, ref, body) => {
-		// buka halaman ref dulu supaya Cloudflare challenge (kalau ada) kelar &
-		// cf_clearance kepasang di konteks.
+	let warmed = false;
+	const warmUp = async (ref) => {
+		if (warmed) return;
 		try {
 			await page.goto(base + ref, { waitUntil: "domcontentloaded", timeout: 45000 });
-			await page.waitForTimeout(2500);
-			// kalau masih di halaman challenge, tunggu lebih lama
-			if (/just a moment|checking your browser|cf-browser-verification/i.test(await page.content())) {
-				await page.waitForTimeout(6000);
-			}
-		} catch (e) {
-			/* lanjut, fetch di bawah yang menentukan */
+		} catch {
+			/* ignore */
 		}
+		// tunggu Cloudflare challenge kelar (maks ~25 detik)
+		for (let t = 0; t < 12; t++) {
+			const c = await page.content().catch(() => "");
+			if (!/just a moment|checking your browser|cf-browser-verification|challenge-platform|enable javascript and cookies/i.test(c)) break;
+			await page.waitForTimeout(2200);
+		}
+		await page.waitForTimeout(1500);
+		warmed = true;
+	};
+	const fetchAll = async (path, ref, body) => {
+		await warmUp(ref);
 		const PAGE = 100;
 		const rows = [];
 		for (let pg = 0; pg < 100; pg++) {
@@ -621,7 +635,9 @@ async function scrapeMozart(base, cookie, startDate, endDate) {
 			);
 			if (res.status === 401) throw new Error("MOZART 401: cookie/atoken ditolak / kedaluwarsa. Perbarui di Setting.");
 			if (res.status === 403 || res.status === 503) {
-				throw new Error("MOZART masih diblokir Cloudflare walau via browser. Coba tempel cookie lengkap termasuk cf_clearance.");
+				const title = await page.title().catch(() => "");
+				const snip = String(res.text || "").replace(/\s+/g, " ").slice(0, 140);
+				throw new Error(`MOZART ${res.status} diblokir Cloudflare walau via browser (stealth). page="${title}" resp="${snip}"`);
 			}
 			if (res.status >= 400 || res.status === 0) {
 				if (pg === 0) throw new Error("MOZART error " + res.status + ": " + String(res.text).slice(0, 120));
