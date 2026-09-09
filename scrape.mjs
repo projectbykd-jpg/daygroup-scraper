@@ -563,40 +563,75 @@ function mozPick(obj, keys, fb) {
 async function scrapeMozart(base, cookie, startDate, endDate) {
 	const hm = String(base || "").match(/^(https?:\/\/[^/\s?#]+)/i);
 	base = hm ? hm[1] : base.replace(/\/+$/, "");
-	const hdr = (ref) => ({
-		"content-type": "application/json",
-		accept: "application/json, text/plain, */*",
-		"accept-language": "en-US,en;q=0.9",
-		cookie,
-		origin: base,
-		referer: base + ref,
-		"user-agent": UA,
+	const host = base.replace(/^https?:\/\//, "");
+
+	// API Mozart di belakang Cloudflare -> pakai browser asli (Playwright) untuk
+	// melewati challenge, lalu fetch API DARI DALAM konteks browser (punya cf_clearance).
+	const { chromium } = await import("playwright");
+	const browser = await chromium.launch({ headless: true, args: ["--no-sandbox"] });
+	const ctx = await browser.newContext({
+		userAgent: UA,
+		locale: "en-US",
+		viewport: { width: 1366, height: 768 },
 	});
-	const PAGE = 100;
+	// pasang cookie yang dikasih user (atoken, dan cf_clearance kalau ada)
+	const cookies = String(cookie || "")
+		.split(";")
+		.map((s) => s.trim())
+		.filter((s) => s.includes("="))
+		.map((s) => {
+			const i = s.indexOf("=");
+			return { name: s.slice(0, i).trim(), value: s.slice(i + 1).trim(), domain: host, path: "/" };
+		});
+	if (cookies.length) await ctx.addCookies(cookies);
+
+	const page = await ctx.newPage();
 	const fetchAll = async (path, ref, body) => {
+		// buka halaman ref dulu supaya Cloudflare challenge (kalau ada) kelar &
+		// cf_clearance kepasang di konteks.
+		try {
+			await page.goto(base + ref, { waitUntil: "domcontentloaded", timeout: 45000 });
+			await page.waitForTimeout(2500);
+			// kalau masih di halaman challenge, tunggu lebih lama
+			if (/just a moment|checking your browser|cf-browser-verification/i.test(await page.content())) {
+				await page.waitForTimeout(6000);
+			}
+		} catch (e) {
+			/* lanjut, fetch di bawah yang menentukan */
+		}
+		const PAGE = 100;
 		const rows = [];
-		for (let page = 0; page < 100; page++) {
+		for (let pg = 0; pg < 100; pg++) {
+			const res = await page.evaluate(
+				async ({ url, payload }) => {
+					try {
+						const r = await fetch(url, {
+							method: "POST",
+							headers: { "content-type": "application/json", accept: "application/json, text/plain, */*" },
+							body: JSON.stringify(payload),
+							credentials: "include",
+						});
+						const t = await r.text();
+						return { status: r.status, text: t };
+					} catch (e) {
+						return { status: 0, text: String(e && e.message) };
+					}
+				},
+				{ url: base + path, payload: { ...body, page_number: pg, page_size: PAGE } },
+			);
+			if (res.status === 401) throw new Error("MOZART 401: cookie/atoken ditolak / kedaluwarsa. Perbarui di Setting.");
+			if (res.status === 403 || res.status === 503) {
+				throw new Error("MOZART masih diblokir Cloudflare walau via browser. Coba tempel cookie lengkap termasuk cf_clearance.");
+			}
+			if (res.status >= 400 || res.status === 0) {
+				if (pg === 0) throw new Error("MOZART error " + res.status + ": " + String(res.text).slice(0, 120));
+				break;
+			}
 			let j;
 			try {
-				const r = await fetch(base + path, {
-					method: "POST",
-					headers: hdr(ref),
-					body: JSON.stringify({ ...body, page_number: page, page_size: PAGE }),
-				});
-				const t = await r.text();
-				if (r.status === 401) throw new Error("MOZART 401: cookie ditolak / kedaluwarsa. Perbarui cookie Mozart.");
-				if (r.status === 403 || r.status === 503) {
-					const cf = /cloudflare|cf-ray|attention required|just a moment|ie6 oldie|__cf_chl|challenge-platform/i.test(t);
-					throw new Error(
-						cf
-							? "MOZART diblokir Cloudflare. Tempel COOKIE LENGKAP dari browser (harus ada cf_clearance), dan pastikan Link Mozart hanya domain (tanpa /wd)."
-							: "MOZART " + r.status + ": " + t.slice(0, 120),
-					);
-				}
-				if (r.status >= 400) throw new Error("MOZART HTTP " + r.status);
-				j = JSON.parse(t);
-			} catch (e) {
-				if (page === 0) throw e;
+				j = JSON.parse(res.text);
+			} catch {
+				if (pg === 0) throw new Error("Respons Mozart bukan JSON: " + String(res.text).slice(0, 120));
 				break;
 			}
 			const f = mozFindRows(j);
@@ -605,6 +640,16 @@ async function scrapeMozart(base, cookie, startDate, endDate) {
 		}
 		return rows;
 	};
+	let result;
+	try {
+		result = await mozartCollect(fetchAll, startDate, endDate);
+	} finally {
+		await browser.close().catch(() => {});
+	}
+	return result;
+}
+
+async function mozartCollect(fetchAll, startDate, endDate) {
 	const depoRows = await fetchAll("/api/transactions/fetchTransaction", "/transactions", {
 		panel_id: 0,
 		start_date: startDate,

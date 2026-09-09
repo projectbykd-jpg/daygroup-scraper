@@ -1,0 +1,9 @@
+{
+  "name": "daygroup-scraper",
+  "private": true,
+  "type": "module",
+  "description": "Scraper Laporan Harian Day-Group Panel (GitHub Actions). Playwright dipasang on-demand di workflow untuk job Mozart.",
+  "scripts": {
+    "start": "node scrape.mjs"
+  }
+}

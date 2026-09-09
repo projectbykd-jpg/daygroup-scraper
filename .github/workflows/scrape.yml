@@ -7,9 +7,10 @@ name: Scrape Laporan Harian
 on:
   workflow_dispatch:
     inputs:
-      job_id:      { description: "ID job di panel-worker", required: true }
-      callback:    { description: "Base URL panel-worker (https://...)", required: true }
-      key:         { description: "Token sekali-pakai untuk callback", required: true }
+      job_id:   { description: "ID job di panel-worker", required: true }
+      callback: { description: "Base URL panel-worker (https://...)", required: true }
+      key:      { description: "Token sekali-pakai untuk callback", required: true }
+      kind:     { description: "admin | mozart", required: false, default: "admin" }
 
 concurrency:
   group: scrape-${{ github.event.inputs.job_id }}
@@ -18,14 +19,23 @@ concurrency:
 jobs:
   scrape:
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 25
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with: { node-version: "20" }
+
+      # Playwright hanya untuk Mozart (API di belakang Cloudflare -> perlu browser asli).
+      - name: Setup Playwright (mozart)
+        if: ${{ github.event.inputs.kind == 'mozart' }}
+        run: |
+          npm i playwright@1.47.2 --no-save
+          npx playwright install --with-deps chromium
+
       - name: Run scraper
         env:
           JOB_ID: ${{ github.event.inputs.job_id }}
           CALLBACK: ${{ github.event.inputs.callback }}
           KEY: ${{ github.event.inputs.key }}
+          KIND: ${{ github.event.inputs.kind }}
         run: node scrape.mjs
