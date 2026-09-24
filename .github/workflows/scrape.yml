@@ -13,16 +13,20 @@ on:
       kind:     { description: "admin | mozart", required: false, default: "admin" }
 
 concurrency:
-  group: scrape-${{ github.event.inputs.job_id }}
+  # Laporan Harian mengakses sumber admin yang sama dari banyak user.
+  # Proses bergiliran per jenis agar 17+ user tidak menghantam target bersamaan.
+  # queue:max menjaga pending job tetap antre (hingga 100), bukan saling mengganti.
+  group: scrape-${{ github.event.inputs.kind || 'admin' }}
   cancel-in-progress: false
+  queue: max
 
 jobs:
   scrape:
     runs-on: ubuntu-latest
     timeout-minutes: 25
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
         with: { node-version: "20" }
 
       # Playwright hanya untuk Mozart (API di belakang Cloudflare -> perlu browser asli).
@@ -32,10 +36,30 @@ jobs:
           npm i playwright@1.47.2 playwright-extra@4.3.6 puppeteer-extra-plugin-stealth@2.11.2 --no-save
           npx playwright install --with-deps chromium
 
-      - name: Run scraper
+      # Jangan biarkan token callback muncul sebagai teks biasa di log.
+      - name: Mask callback key
+        run: echo "::add-mask::${{ github.event.inputs.key }}"
+
+      - name: Run scraper (retry transient failure)
         env:
           JOB_ID: ${{ github.event.inputs.job_id }}
           CALLBACK: ${{ github.event.inputs.callback }}
           KEY: ${{ github.event.inputs.key }}
           KIND: ${{ github.event.inputs.kind }}
-        run: node scrape.mjs
+        run: |
+          set -u
+          last_status=1
+          for attempt in 1 2 3; do
+            echo "=== Scraper attempt ${attempt}/3 ==="
+            if node scrape.mjs; then
+              echo "=== Scraper sukses pada attempt ${attempt} ==="
+              exit 0
+            fi
+            last_status=$?
+            echo "=== Scraper gagal pada attempt ${attempt} (exit ${last_status}) ==="
+            if [ "${attempt}" -lt 3 ]; then
+              sleep $((attempt * 8))
+            fi
+          done
+          echo "=== Scraper gagal setelah 3 attempt ==="
+          exit "${last_status}"
