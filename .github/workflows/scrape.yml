@@ -10,13 +10,14 @@ on:
       job_id:   { description: "ID job di panel-worker", required: true }
       callback: { description: "Base URL panel-worker (https://...)", required: true }
       key:      { description: "Token sekali-pakai untuk callback", required: true }
-      kind:     { description: "admin | mozart", required: false, default: "admin" }
+      kind:      { description: "admin | mozart", required: false, default: "admin" }
+      queue_key: { description: "Antrian per sumber (hostname)", required: false, default: "shared" }
 
 concurrency:
   # Laporan Harian mengakses sumber admin yang sama dari banyak user.
   # Proses bergiliran per jenis agar 17+ user tidak menghantam target bersamaan.
   # queue:max menjaga pending job tetap antre (hingga 100), bukan saling mengganti.
-  group: scrape-${{ github.event.inputs.kind || 'admin' }}
+  group: scrape-${{ github.event.inputs.queue_key || github.event.inputs.kind || 'admin' }}
   cancel-in-progress: false
   queue: max
 
