@@ -12,21 +12,44 @@ const KEY = process.env.KEY;
 const UA =
 	"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36";
 
+function retryableHttpStatus(status) {
+	return status === 408 || status === 425 || status === 429 || (status >= 500 && status <= 599);
+}
+
 async function api(action, body) {
-	const r = await fetch(`${CALLBACK}/api`, {
-		method: "POST",
-		headers: { "content-type": "application/json" },
-		body: JSON.stringify({ action, jobId: JOB_ID, key: KEY, ...body }),
-	});
-	const t = await r.text();
-	let j;
-	try {
-		j = JSON.parse(t);
-	} catch {
-		throw new Error(`callback ${action} bukan JSON: ${t.slice(0, 200)}`);
+	const payload = JSON.stringify({ action, jobId: JOB_ID, key: KEY, ...body });
+	let lastErr = null;
+	for (let attempt = 1; attempt <= 4; attempt++) {
+		try {
+			const r = await fetch(`${CALLBACK}/api`, {
+				method: "POST",
+				headers: { "content-type": "application/json" },
+				body: payload,
+				signal: AbortSignal.timeout(30000),
+			});
+			const t = await r.text();
+			if (!r.ok) {
+				const err = new Error(`callback ${action} HTTP ${r.status}: ${t.slice(0, 180)}`);
+				if (!retryableHttpStatus(r.status) || attempt === 4) throw err;
+				lastErr = err;
+				await new Promise((resolve) => setTimeout(resolve, attempt * 1500));
+				continue;
+			}
+			let j;
+			try {
+				j = JSON.parse(t);
+			} catch {
+				throw new Error(`callback ${action} bukan JSON: ${t.slice(0, 200)}`);
+			}
+			if (j && j.success === false) throw new Error(j.message || `callback ${action} gagal`);
+			return j;
+		} catch (e) {
+			lastErr = e;
+			if (attempt === 4) throw e;
+			await new Promise((resolve) => setTimeout(resolve, attempt * 1500));
+		}
 	}
-	if (j && j.success === false) throw new Error(j.message || `callback ${action} gagal`);
-	return j;
+	throw lastErr instanceof Error ? lastErr : new Error(String(lastErr));
 }
 
 // ---------------------------------------------------------------------------
@@ -41,20 +64,34 @@ function makeHeaders(cookie) {
 		Accept: "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
 	};
 }
-async function getText(url, headers) {
-	try {
-		const r = await fetch(url, { headers, redirect: "manual" });
-		return await r.text();
-	} catch {
-		return "";
+async function getText(url, headers, { attempts = 4, timeoutMs = 25000 } = {}) {
+	let lastErr = null;
+	for (let attempt = 1; attempt <= attempts; attempt++) {
+		try {
+			const r = await fetch(url, { headers, redirect: "manual", signal: AbortSignal.timeout(timeoutMs) });
+			const text = await r.text();
+			if (r.ok) return text;
+			const err = new Error(`target HTTP ${r.status} untuk ${url}`);
+			// Jangan menganggap 401/403/redirect sebagai halaman kosong; itu akan
+			// membuat hasil terlihat sukses padahal data terpotong.
+			if (!retryableHttpStatus(r.status) || attempt === attempts) throw err;
+			lastErr = err;
+		} catch (e) {
+			lastErr = e;
+			if (attempt === attempts) throw e;
+		}
+		await new Promise((resolve) => setTimeout(resolve, Math.min(8000, attempt * 1000)));
 	}
+	throw lastErr instanceof Error ? lastErr : new Error(String(lastErr));
 }
-async function getAll(urls, headers, batch = 25) {
+async function getAll(urls, headers, batch = 12) {
 	const out = [];
 	for (let i = 0; i < urls.length; i += batch) {
 		const chunk = urls.slice(i, i + batch);
 		const res = await Promise.allSettled(chunk.map((u) => getText(u, headers)));
-		for (const s of res) out.push(s.status === "fulfilled" ? s.value : "");
+		const failed = res.find((s) => s.status === "rejected");
+		if (failed) throw failed.reason instanceof Error ? failed.reason : new Error(String(failed.reason));
+		for (const s of res) out.push(s.value);
 	}
 	return out;
 }
@@ -64,7 +101,7 @@ async function getAll(urls, headers, batch = 25) {
  * urlOf(p) -> url; parseFn(html) -> array baris; keyOf(row) -> string dedup.
  * firstHtml boleh diberikan (hasil fetch halaman 1) supaya tidak diambil 2x.
  */
-async function pagesUntilEmpty(urlOf, headers, parseFn, keyOf, firstHtml, { chunk = 20, max = 5000 } = {}) {
+async function pagesUntilEmpty(urlOf, headers, parseFn, keyOf, firstHtml, { chunk = 12, max = 5000 } = {}) {
 	const rows = [];
 	const seen = new Set();
 	let pagesScanned = 0;
@@ -304,14 +341,14 @@ async function scrapeRegister(baseUrl, headers, startDate, endDate) {
 	if (/silakan login|please login/i.test(html1)) throw new Error("Cookie Admin kedaluwarsa (Session Expired).");
 
 	const pk = (r) => r.userId;
-	const allPlayers = await pagesUntilEmpty(listUrl, headers, (h) => parseAgentPlayerList(h), pk, html1, { chunk: 20, max: 1500 });
+	const allPlayers = await pagesUntilEmpty(listUrl, headers, (h) => parseAgentPlayerList(h), pk, html1, { chunk: 12, max: 1500 });
 	const rawNonRef = await pagesUntilEmpty(nonRefUrl, headers, (h) => parseAgentPlayerList(h), pk, htmlNR1, { chunk: 20, max: 1500 });
 
 	// detail depo/wd per player
 	const detail = {};
 	if (allPlayers.length) {
 		const urls = allPlayers.map((p) => `${baseUrl}/depo_user_det.php?user=${encodeURIComponent(p.userId)}`);
-		const htmls = await getAll(urls, headers, 40);
+		const htmls = await getAll(urls, headers, 18);
 		htmls.forEach((h, i) => {
 			detail[allPlayers[i].userId] = parseHugoResponse(h);
 		});
@@ -376,7 +413,7 @@ async function scrapeReportAgent(baseUrl, headers, startDate, endDate) {
 			}),
 		),
 	);
-	const firstHtmls = await getAll(first.map((x) => x.u), headers, 30);
+	const firstHtmls = await getAll(first.map((x) => x.u), headers, 12);
 	let allData = [];
 	// per (operator, statusgroup): halaman 1 sudah diambil, lanjut sampai kosong.
 	const rowKey = (r) => `${r.tanggalTerima}|${r.user}|${r.action}|${r.jumlah}|${r.operator}`;
@@ -390,7 +427,7 @@ async function scrapeReportAgent(baseUrl, headers, startDate, endDate) {
 			(h) => parseAgentOperatorRows(h, op),
 			rowKey,
 			firstHtmls[i],
-			{ chunk: 15, max: 120 },
+			{ chunk: 12, max: 120 },
 		);
 		if (rows.length) allData = allData.concat(rows);
 	}
@@ -424,7 +461,7 @@ async function scrapeCheckCoin(baseUrl, headers, startDate, endDate) {
 		(h) => parseCoinHtmlRows(h, []),
 		coinKey,
 		htmlP1,
-		{ chunk: 20, max: 6000 },
+		{ chunk: 12, max: 6000 },
 	);
 	const pagesScanned = raw._pagesScanned || 0;
 
@@ -516,7 +553,7 @@ async function scrapeCheckCoin(baseUrl, headers, startDate, endDate) {
 		(h) => parseWithdrawPgaIdfRows(h),
 		(r) => `${r.date}|${r.to}|${r.by}|${r.nominal}`,
 		null,
-		{ chunk: 20, max: 3000 },
+		{ chunk: 12, max: 3000 },
 	);
 	wdList.forEach((r, i) => (r.no = i + 1));
 	const totalNominalWdPgaIdf = wdList.reduce((s, x) => s + x.nominal, 0);
